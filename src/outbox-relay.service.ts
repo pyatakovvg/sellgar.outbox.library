@@ -86,11 +86,28 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
     };
 
     try {
-      await firstValueFrom(this.eventClient.emit(event.eventType, envelope));
+      await this.emitWithTimeout(event.eventType, envelope);
       await this.outboxRepository.markPublished(event);
     } catch (error) {
       await this.outboxRepository.markFailed(event, this.getNextAttemptAt(event.attempts + 1), error);
     }
+  }
+
+  private async emitWithTimeout(eventType: string, envelope: Record<string, unknown>) {
+    const timeoutMs = this.getConfiguredNumber(this.options.publishTimeoutMs, 'OUTBOX_PUBLISH_TIMEOUT_MS', 5000);
+    const publishPromise = firstValueFrom(this.eventClient.emit(eventType, envelope));
+    publishPromise.catch(() => undefined);
+
+    await Promise.race([
+      publishPromise,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          const error = new Error(`outbox publish timeout after ${timeoutMs}ms`);
+          error.name = 'OUTBOX_PUBLISH_TIMEOUT';
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
   }
 
   private async logMetrics() {

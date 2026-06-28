@@ -1,5 +1,4 @@
 import { DynamicModule, Module } from '@nestjs/common';
-import { ModuleRef } from '@nestjs/core';
 import { ClientProxy } from '@nestjs/microservices';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -24,8 +23,8 @@ export class OutboxModule {
         },
         {
           provide: OUTBOX_EVENT_CLIENT,
-          useFactory: (moduleRef: ModuleRef) => moduleRef.get<ClientProxy>(options.eventClientToken, { strict: false }),
-          inject: [ModuleRef],
+          useFactory: (eventClient: ClientProxy) => eventClient,
+          inject: [options.eventClientToken],
         },
         OutboxRepository,
         OutboxRelayService,

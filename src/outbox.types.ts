@@ -8,4 +8,5 @@ export interface OutboxModuleOptions {
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
   processingTimeoutMs?: number;
+  publishTimeoutMs?: number;
 }

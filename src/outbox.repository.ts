@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource, In, LessThan } from 'typeorm';
+import { DataSource, LessThan } from 'typeorm';
 
 import { OutboxEventModel } from './outbox-event.model';
 
@@ -16,13 +16,15 @@ export interface OutboxMetrics {
   oldestUnpublishedAgeSeconds: number;
 }
 
+type OutboxEventRow = Record<string, any>;
+
 @Injectable()
 export class OutboxRepository {
   constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
 
   async claimPublishableEvents(options: ClaimOptions) {
     return this.dataSource.transaction(async (manager) => {
-      const claimedRows: Array<{ uuid: string }> = await manager.query(
+      const queryResult = await manager.query(
         `
           UPDATE outbox_event
           SET
@@ -39,21 +41,28 @@ export class OutboxRepository {
             LIMIT $2
             FOR UPDATE SKIP LOCKED
           )
-          RETURNING uuid
+          RETURNING
+            uuid,
+            producer,
+            aggregate_type,
+            aggregate_uuid,
+            aggregate_version,
+            event_type,
+            schema_version,
+            payload,
+            occurred_at,
+            published_at,
+            next_attempt_at,
+            processing_started_at,
+            status,
+            attempts,
+            last_error
         `,
         [options.maxAttempts, options.batchSize],
       );
+      const claimedRows = this.normalizeQueryRows(queryResult);
 
-      const uuids = claimedRows.map((row) => row.uuid);
-
-      if (uuids.length === 0) {
-        return [];
-      }
-
-      return manager.find(OutboxEventModel, {
-        where: { uuid: In(uuids) },
-        order: { occurredAt: 'ASC' },
-      });
+      return claimedRows.map((row) => this.mapClaimedRow(row));
     });
   }
 
@@ -110,5 +119,75 @@ export class OutboxRepository {
       processingCount: Number(metrics.processingCount),
       oldestUnpublishedAgeSeconds: Number(metrics.oldestUnpublishedAgeSeconds),
     };
+  }
+
+  private mapClaimedRow(row: OutboxEventRow) {
+    const event = new OutboxEventModel();
+
+    event.uuid = this.readRowValue(row, 'uuid');
+    event.producer = this.readRowValue(row, 'producer');
+    event.aggregateType = this.readRowValue(row, 'aggregate_type', 'aggregateType', 'aggregatetype');
+    event.aggregateUuid = this.readRowValue(row, 'aggregate_uuid', 'aggregateUuid', 'aggregateuuid');
+    event.aggregateVersion = Number(this.readRowValue(row, 'aggregate_version', 'aggregateVersion', 'aggregateversion'));
+    event.eventType = this.readRowValue(row, 'event_type', 'eventType', 'eventtype');
+    event.schemaVersion = Number(this.readRowValue(row, 'schema_version', 'schemaVersion', 'schemaversion'));
+    event.payload = this.readRowValue(row, 'payload');
+    event.occurredAt = this.readRowDate(row, 'occurred_at', 'occurredAt', 'occurredat');
+    event.publishedAt = this.readOptionalRowDate(row, 'published_at', 'publishedAt', 'publishedat');
+    event.nextAttemptAt = this.readOptionalRowDate(row, 'next_attempt_at', 'nextAttemptAt', 'nextattemptat');
+    event.processingStartedAt = this.readOptionalRowDate(
+      row,
+      'processing_started_at',
+      'processingStartedAt',
+      'processingstartedat',
+    );
+    event.status = this.readRowValue(row, 'status');
+    event.attempts = Number(this.readRowValue(row, 'attempts'));
+    event.lastError = this.readRowValue(row, 'last_error', 'lastError', 'lasterror') ?? null;
+
+    return event;
+  }
+
+  private normalizeQueryRows(queryResult: unknown): OutboxEventRow[] {
+    if (Array.isArray(queryResult) && Array.isArray(queryResult[0])) {
+      return queryResult[0] as OutboxEventRow[];
+    }
+
+    if (Array.isArray(queryResult)) {
+      return queryResult as OutboxEventRow[];
+    }
+
+    if (queryResult && typeof queryResult === 'object' && Array.isArray((queryResult as { raw?: unknown }).raw)) {
+      return (queryResult as { raw: OutboxEventRow[] }).raw;
+    }
+
+    return [];
+  }
+
+  private readRowValue(row: OutboxEventRow, ...keys: string[]) {
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(row, key)) {
+        return row[key];
+      }
+    }
+
+    return undefined;
+  }
+
+  private readRowDate(row: OutboxEventRow, ...keys: string[]) {
+    const value = this.readRowValue(row, ...keys);
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+      throw new Error(`invalid outbox date value for keys ${keys.join(', ')}`);
+    }
+
+    return date;
+  }
+
+  private readOptionalRowDate(row: OutboxEventRow, ...keys: string[]) {
+    const value = this.readRowValue(row, ...keys);
+
+    return value ? new Date(value) : null;
   }
 }

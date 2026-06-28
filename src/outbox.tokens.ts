@@ -1,0 +1,2 @@
+export const OUTBOX_OPTIONS = Symbol('OUTBOX_OPTIONS');
+export const OUTBOX_EVENT_CLIENT = Symbol('OUTBOX_EVENT_CLIENT');

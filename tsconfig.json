@@ -4,12 +4,12 @@
     "emitDecoratorMetadata": true,
     "experimentalDecorators": true,
     "module": "commonjs",
-    "moduleResolution": "node",
     "outDir": "./dist",
     "rootDir": "./src",
     "sourceMap": true,
     "strict": true,
-    "target": "ES2023"
+    "target": "ES2023",
+    "ignoreDeprecations": "6.0"
   },
   "include": ["src/**/*.ts"]
 }

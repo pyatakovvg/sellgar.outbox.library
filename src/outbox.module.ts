@@ -14,6 +14,7 @@ import { OutboxWriter } from './outbox-writer.service';
 export class OutboxModule {
   static forRoot(options: OutboxModuleOptions): DynamicModule {
     return {
+      global: true,
       module: OutboxModule,
       imports: [ScheduleModule.forRoot(), TypeOrmModule.forFeature([OutboxEventModel])],
       providers: [

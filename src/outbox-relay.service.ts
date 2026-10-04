@@ -79,7 +79,7 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
       schemaVersion: event.schemaVersion,
       producer: event.producer,
       aggregateType: event.aggregateType,
-      aggregateUuid: event.aggregateUuid,
+      aggregateId: event.aggregateId,
       aggregateVersion: event.aggregateVersion,
       occurredAt: event.occurredAt.toISOString(),
       payload: event.payload,

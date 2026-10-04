@@ -45,7 +45,7 @@ export class OutboxRepository {
             uuid,
             producer,
             aggregate_type,
-            aggregate_uuid,
+            aggregate_id,
             aggregate_version,
             event_type,
             schema_version,
@@ -127,7 +127,7 @@ export class OutboxRepository {
     event.uuid = this.readRowValue(row, 'uuid');
     event.producer = this.readRowValue(row, 'producer');
     event.aggregateType = this.readRowValue(row, 'aggregate_type', 'aggregateType', 'aggregatetype');
-    event.aggregateUuid = this.readRowValue(row, 'aggregate_uuid', 'aggregateUuid', 'aggregateuuid');
+    event.aggregateId = this.readRowValue(row, 'aggregate_id', 'aggregateId', 'aggregateid');
     event.aggregateVersion = Number(this.readRowValue(row, 'aggregate_version', 'aggregateVersion', 'aggregateversion'));
     event.eventType = this.readRowValue(row, 'event_type', 'eventType', 'eventtype');
     event.schemaVersion = Number(this.readRowValue(row, 'schema_version', 'schemaVersion', 'schemaversion'));

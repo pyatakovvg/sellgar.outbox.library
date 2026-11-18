@@ -1,22 +1,20 @@
 import { DynamicModule, Module } from '@nestjs/common';
 import { ClientProxy } from '@nestjs/microservices';
-import { ScheduleModule } from '@nestjs/schedule';
-import { TypeOrmModule } from '@nestjs/typeorm';
-
-import { OutboxEventModel } from './outbox-event.model';
 import { OutboxRelayService } from './outbox-relay.service';
 import { OutboxRepository } from './outbox.repository';
 import { OUTBOX_EVENT_CLIENT, OUTBOX_OPTIONS } from './outbox.tokens';
 import { OutboxModuleOptions } from './outbox.types';
 import { OutboxWriter } from './outbox-writer.service';
+import { resolveOutboxStorage } from './outbox-storage';
 
 @Module({})
 export class OutboxModule {
   static forRoot(options: OutboxModuleOptions): DynamicModule {
+    resolveOutboxStorage(options);
+
     return {
       global: true,
       module: OutboxModule,
-      imports: [ScheduleModule.forRoot(), TypeOrmModule.forFeature([OutboxEventModel])],
       providers: [
         {
           provide: OUTBOX_OPTIONS,
@@ -31,7 +29,7 @@ export class OutboxModule {
         OutboxRelayService,
         OutboxWriter,
       ],
-      exports: [OutboxWriter],
+      exports: [OutboxWriter, OutboxRepository],
     };
   }
 }

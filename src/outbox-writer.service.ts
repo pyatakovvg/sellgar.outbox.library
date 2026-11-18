@@ -1,16 +1,16 @@
-import { Inject, Injectable } from "@nestjs/common";
-import { randomUUID } from "node:crypto";
-import { EntityManager } from "typeorm";
+import { Inject, Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { EntityManager } from 'typeorm';
 
-import { OUTBOX_OPTIONS } from "./outbox.tokens";
-import { OutboxEventModel } from "./outbox-event.model";
-import { OutboxModuleOptions } from "./outbox.types";
+import { resolveOutboxStorage } from './outbox-storage';
+import { OUTBOX_OPTIONS } from './outbox.tokens';
+import { OutboxModuleOptions } from './outbox.types';
 
 export interface OutboxEventInput {
   eventType: string;
   aggregateType: string;
   aggregateId: string;
-  aggregateVersion: number;
+  aggregateVersion: number | string;
   payload: Record<string, unknown>;
   schemaVersion?: number;
   occurredAt?: Date;
@@ -18,37 +18,55 @@ export interface OutboxEventInput {
 
 @Injectable()
 export class OutboxWriter {
-  constructor(
-    @Inject(OUTBOX_OPTIONS) private readonly options: OutboxModuleOptions,
-  ) {}
+  private readonly storage;
+
+  constructor(@Inject(OUTBOX_OPTIONS) private readonly options: OutboxModuleOptions) {
+    this.storage = resolveOutboxStorage(options);
+  }
 
   add(manager: EntityManager, event: OutboxEventInput): Promise<void> {
     return this.addMany(manager, [event]);
   }
 
-  async addMany(
-    manager: EntityManager,
-    events: OutboxEventInput[],
-  ): Promise<void> {
-    if (events.length === 0) {
-      return;
-    }
+  async addMany(manager: EntityManager, events: OutboxEventInput[]): Promise<void> {
+    if (events.length === 0) return;
 
-    const models = events.map((event) =>
-      manager.create(OutboxEventModel, {
-        uuid: randomUUID(),
-        producer: this.options.producer,
-        aggregateType: event.aggregateType,
-        aggregateId: event.aggregateId,
-        aggregateVersion: event.aggregateVersion,
-        eventType: event.eventType,
-        schemaVersion: event.schemaVersion ?? 1,
-        payload: event.payload,
-        occurredAt: event.occurredAt ?? new Date(),
-        status: "pending",
-        attempts: 0,
-      }),
-    );
-    await manager.getRepository(OutboxEventModel).save(models);
+    const columns = [
+      'uuid',
+      ...(this.storage.hasProducerColumn ? ['producer'] : []),
+      'aggregate_type',
+      this.storage.aggregateIdColumn,
+      'aggregate_version',
+      'event_type',
+      'schema_version',
+      'payload',
+      'occurred_at',
+      'status',
+      'attempts',
+    ];
+    const parameters: unknown[] = [];
+    const rows = events.map((event) => {
+      const values = [
+        randomUUID(),
+        ...(this.storage.hasProducerColumn ? [this.options.producer] : []),
+        event.aggregateType,
+        event.aggregateId,
+        event.aggregateVersion,
+        event.eventType,
+        event.schemaVersion ?? 1,
+        JSON.stringify(event.payload),
+        event.occurredAt ?? new Date(),
+        'pending',
+        0,
+      ];
+      return `(${values
+        .map((value) => {
+          parameters.push(value);
+          return `$${parameters.length}`;
+        })
+        .join(', ')})`;
+    });
+
+    await manager.query(`INSERT INTO outbox_event (${columns.join(', ')}) VALUES ${rows.join(', ')}`, parameters);
   }
 }

@@ -1,8 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource, LessThan } from 'typeorm';
+import { DataSource } from 'typeorm';
 
 import { OutboxEventModel } from './outbox-event.model';
+import { resolveOutboxStorage } from './outbox-storage';
+import { OUTBOX_OPTIONS } from './outbox.tokens';
+import { OutboxModuleOptions } from './outbox.types';
 
 interface ClaimOptions {
   batchSize: number;
@@ -13,6 +16,7 @@ export interface OutboxMetrics {
   pendingCount: number;
   failedCount: number;
   processingCount: number;
+  deadCount: number;
   oldestUnpublishedAgeSeconds: number;
 }
 
@@ -20,87 +24,108 @@ type OutboxEventRow = Record<string, any>;
 
 @Injectable()
 export class OutboxRepository {
-  constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
+  private readonly storage;
 
-  async claimPublishableEvents(options: ClaimOptions) {
+  constructor(
+    @InjectDataSource() private readonly dataSource: DataSource,
+    @Optional() @Inject(OUTBOX_OPTIONS) private readonly options?: OutboxModuleOptions,
+  ) {
+    this.storage = resolveOutboxStorage(options);
+  }
+
+  async claimPublishableEvents(options: ClaimOptions): Promise<OutboxEventModel[]> {
+    const idColumn = this.storage.aggregateIdColumn;
+    const producerMatch = this.storage.hasProducerColumn ? 'AND predecessor.producer = candidate.producer' : '';
+
     return this.dataSource.transaction(async (manager) => {
-      const queryResult = await manager.query(
+      const result = await manager.query(
         `
-          UPDATE outbox_event
-          SET
-            status = 'processing',
-            processing_started_at = NOW(),
-            last_error = NULL
-          WHERE uuid IN (
-            SELECT uuid
-            FROM outbox_event
-            WHERE status IN ('pending', 'failed')
-              AND attempts < $1
-              AND COALESCE(next_attempt_at, occurred_at) <= NOW()
-            ORDER BY occurred_at ASC
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
+        WITH claimed AS (
+          UPDATE outbox_event AS event
+          SET status = 'processing', processing_started_at = NOW(), last_error = NULL
+          WHERE event.uuid IN (
+            SELECT candidate.uuid FROM outbox_event AS candidate
+            WHERE candidate.status IN ('pending', 'failed')
+              AND candidate.attempts < $1
+              AND COALESCE(candidate.next_attempt_at, candidate.occurred_at) <= NOW()
+              AND NOT EXISTS (
+                SELECT 1 FROM outbox_event AS predecessor
+                WHERE predecessor.aggregate_type = candidate.aggregate_type
+                  ${producerMatch}
+                  AND predecessor.${idColumn} = candidate.${idColumn}
+                  AND predecessor.aggregate_version < candidate.aggregate_version
+                  AND predecessor.status <> 'published'
+              )
+            ORDER BY candidate.occurred_at ASC, candidate.uuid ASC
+            LIMIT $2 FOR UPDATE OF candidate SKIP LOCKED
           )
-          RETURNING
-            uuid,
-            producer,
-            aggregate_type,
-            aggregate_id,
-            aggregate_version,
-            event_type,
-            schema_version,
-            payload,
-            occurred_at,
-            published_at,
-            next_attempt_at,
-            processing_started_at,
-            status,
-            attempts,
-            last_error
-        `,
+          RETURNING event.*
+        )
+        SELECT * FROM claimed ORDER BY occurred_at ASC, uuid ASC
+      `,
         [options.maxAttempts, options.batchSize],
       );
-      const claimedRows = this.normalizeQueryRows(queryResult);
 
-      return claimedRows.map((row) => this.mapClaimedRow(row));
+      return this.rows(result).map((row) =>
+        Object.assign(new OutboxEventModel(), {
+          uuid: row.uuid,
+          producer: this.storage.hasProducerColumn ? row.producer : this.options?.producer,
+          aggregateType: row.aggregate_type,
+          aggregateId: row[idColumn],
+          aggregateVersion: row.aggregate_version,
+          eventType: row.event_type,
+          schemaVersion: Number(row.schema_version),
+          payload: row.payload,
+          occurredAt: new Date(row.occurred_at),
+          publishedAt: row.published_at ? new Date(row.published_at) : null,
+          nextAttemptAt: row.next_attempt_at ? new Date(row.next_attempt_at) : null,
+          processingStartedAt: row.processing_started_at ? new Date(row.processing_started_at) : null,
+          status: row.status,
+          attempts: Number(row.attempts),
+          lastError: row.last_error,
+        }),
+      );
     });
   }
 
-  releaseTimedOutProcessingEvents(timeoutMs: number) {
-    return this.dataSource.manager.update(
-      OutboxEventModel,
-      {
-        status: 'processing',
-        processingStartedAt: LessThan(new Date(Date.now() - timeoutMs)),
-      },
-      {
-        status: 'failed',
-        nextAttemptAt: new Date(),
-        processingStartedAt: null,
-        lastError: 'processing timeout',
-      },
+  releaseTimedOutProcessingEvents(timeoutMs: number, maxAttempts = 10) {
+    return this.dataSource.manager.query(
+      `
+      UPDATE outbox_event
+      SET status = CASE WHEN attempts >= $2 THEN $3 ELSE 'failed' END,
+        next_attempt_at = NOW(), processing_started_at = NULL, last_error = 'processing timeout'
+      WHERE status = 'processing'
+        AND processing_started_at < NOW() - ($1 * INTERVAL '1 millisecond')
+    `,
+      [timeoutMs, maxAttempts, this.storage.exhaustedStatus],
     );
   }
 
   markPublished(event: OutboxEventModel) {
-    return this.dataSource.manager.update(OutboxEventModel, event.uuid, {
-      status: 'published',
-      publishedAt: new Date(),
-      nextAttemptAt: null,
-      processingStartedAt: null,
-      attempts: event.attempts + 1,
-      lastError: null,
-    });
+    return this.dataSource.manager.query(
+      `
+      UPDATE outbox_event SET status = 'published', published_at = NOW(), next_attempt_at = NULL,
+        processing_started_at = NULL, attempts = $2, last_error = NULL
+      WHERE uuid = $1
+    `,
+      [event.uuid, event.attempts + 1],
+    );
   }
 
-  markFailed(event: OutboxEventModel, nextAttemptAt: Date, error: unknown) {
-    return this.dataSource.manager.update(OutboxEventModel, event.uuid, {
-      status: 'failed',
-      nextAttemptAt,
-      processingStartedAt: null,
-      attempts: event.attempts + 1,
-      lastError: error instanceof Error ? error.message : String(error),
-    });
+  markFailed(event: OutboxEventModel, nextAttemptAt: Date, error: unknown, exhausted = false) {
+    return this.dataSource.manager.query(
+      `
+      UPDATE outbox_event SET status = $5, next_attempt_at = $3, processing_started_at = NULL,
+        attempts = $2, last_error = $4 WHERE uuid = $1
+    `,
+      [
+        event.uuid,
+        event.attempts + 1,
+        nextAttemptAt,
+        error instanceof Error ? error.message : String(error),
+        exhausted ? this.storage.exhaustedStatus : 'failed',
+      ],
+    );
   }
 
   async getMetrics(): Promise<OutboxMetrics> {
@@ -109,85 +134,18 @@ export class OutboxRepository {
         COUNT(*) FILTER (WHERE status = 'pending')::int AS "pendingCount",
         COUNT(*) FILTER (WHERE status = 'failed')::int AS "failedCount",
         COUNT(*) FILTER (WHERE status = 'processing')::int AS "processingCount",
-        COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(occurred_at) FILTER (WHERE status IN ('pending', 'failed', 'processing'))))::int, 0) AS "oldestUnpublishedAgeSeconds"
+        COUNT(*) FILTER (WHERE status = 'dead')::int AS "deadCount",
+        COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(occurred_at) FILTER
+          (WHERE status <> 'published')))::int, 0) AS "oldestUnpublishedAgeSeconds"
       FROM outbox_event
     `);
-
-    return {
-      pendingCount: Number(metrics.pendingCount),
-      failedCount: Number(metrics.failedCount),
-      processingCount: Number(metrics.processingCount),
-      oldestUnpublishedAgeSeconds: Number(metrics.oldestUnpublishedAgeSeconds),
-    };
+    return metrics;
   }
 
-  private mapClaimedRow(row: OutboxEventRow) {
-    const event = new OutboxEventModel();
-
-    event.uuid = this.readRowValue(row, 'uuid');
-    event.producer = this.readRowValue(row, 'producer');
-    event.aggregateType = this.readRowValue(row, 'aggregate_type', 'aggregateType', 'aggregatetype');
-    event.aggregateId = this.readRowValue(row, 'aggregate_id', 'aggregateId', 'aggregateid');
-    event.aggregateVersion = Number(this.readRowValue(row, 'aggregate_version', 'aggregateVersion', 'aggregateversion'));
-    event.eventType = this.readRowValue(row, 'event_type', 'eventType', 'eventtype');
-    event.schemaVersion = Number(this.readRowValue(row, 'schema_version', 'schemaVersion', 'schemaversion'));
-    event.payload = this.readRowValue(row, 'payload');
-    event.occurredAt = this.readRowDate(row, 'occurred_at', 'occurredAt', 'occurredat');
-    event.publishedAt = this.readOptionalRowDate(row, 'published_at', 'publishedAt', 'publishedat');
-    event.nextAttemptAt = this.readOptionalRowDate(row, 'next_attempt_at', 'nextAttemptAt', 'nextattemptat');
-    event.processingStartedAt = this.readOptionalRowDate(
-      row,
-      'processing_started_at',
-      'processingStartedAt',
-      'processingstartedat',
-    );
-    event.status = this.readRowValue(row, 'status');
-    event.attempts = Number(this.readRowValue(row, 'attempts'));
-    event.lastError = this.readRowValue(row, 'last_error', 'lastError', 'lasterror') ?? null;
-
-    return event;
-  }
-
-  private normalizeQueryRows(queryResult: unknown): OutboxEventRow[] {
-    if (Array.isArray(queryResult) && Array.isArray(queryResult[0])) {
-      return queryResult[0] as OutboxEventRow[];
-    }
-
-    if (Array.isArray(queryResult)) {
-      return queryResult as OutboxEventRow[];
-    }
-
-    if (queryResult && typeof queryResult === 'object' && Array.isArray((queryResult as { raw?: unknown }).raw)) {
-      return (queryResult as { raw: OutboxEventRow[] }).raw;
-    }
-
-    return [];
-  }
-
-  private readRowValue(row: OutboxEventRow, ...keys: string[]) {
-    for (const key of keys) {
-      if (Object.prototype.hasOwnProperty.call(row, key)) {
-        return row[key];
-      }
-    }
-
-    return undefined;
-  }
-
-  private readRowDate(row: OutboxEventRow, ...keys: string[]) {
-    const value = this.readRowValue(row, ...keys);
-    const date = new Date(value);
-
-    if (Number.isNaN(date.getTime())) {
-      throw new Error(`invalid outbox date value for keys ${keys.join(', ')}`);
-    }
-
-    return date;
-  }
-
-  private readOptionalRowDate(row: OutboxEventRow, ...keys: string[]) {
-    const value = this.readRowValue(row, ...keys);
-
-    return value ? new Date(value) : null;
+  private rows(result: unknown): OutboxEventRow[] {
+    if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+    if (Array.isArray(result)) return result;
+    if (result && typeof result === 'object' && 'raw' in result && Array.isArray(result.raw)) return result.raw;
+    throw new Error('Unsupported outbox query result');
   }
 }

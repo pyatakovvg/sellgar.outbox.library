@@ -28,7 +28,19 @@ outbox в backend-сервисах Sellgar.
 - Raw SQL `manager.query` в разных версиях TypeORM может вернуть либо rows, либо
   `[rows, affected]`; claim-логика обязана нормализовать результат перед mapper.
 - Не добавляйте в пакет знания о product/shop/store-specific payload.
+- Порядок изменений одного `(producer, aggregateType, aggregateId)` задаёт
+  `aggregateVersion`, а не timestamp. Claim допускает только первую неопубликованную
+  версию: `pending`, `failed` (включая backoff/исчерпанные попытки) и `processing`
+  предшественники блокируют следующие версии. Другие агрегаты продолжают публикацию.
+- Не полагайтесь на порядок `UPDATE RETURNING`. Relay повторяет claim после публикации,
+  чтобы отправлять последовательные версии в одном цикле, в пределах `batchSize`.
 - Предпочитайте явную конфигурацию скрытым env-допущениям.
+- OutboxModule/Writer/Repository/Relay — единая инфраструктурная реализация для всех
+  потребителей пакета. Сервис хранит только binding options, доменные payload и schemaVersion.
+  Поддерживайте storage aggregate_id/aggregate_uuid, отсутствие producer и failed/dead
+  через явные options; не добавляйте знания об именах сервисов.
+- Не преобразуйте bigint-версии в number. Writer пишет через переданный EntityManager,
+  без регистрации канонической ORM-модели поверх чужой схемы. Схема и миграции принадлежат сервису.
 
 ## Проверка
 
